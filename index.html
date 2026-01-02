@@ -8,6 +8,7 @@
     Cloudflare Pages deploy:
     1) Drag-and-drop this folder into Cloudflare Pages, or
     2) Push to GitHub and connect the repo in Cloudflare Pages.
+    Then add TWELVE_DATA_API_KEY to the Pages environment variables.
     No build step required.
   -->
   <style>
@@ -517,36 +518,18 @@
     </main>
 
     <footer class="footer">
-      <div>Data source: Yahoo Finance quote endpoint (direct or via AllOrigins CORS proxy). No API key required.</div>
-      <div>Deploy: drag-and-drop this folder into Cloudflare Pages or push to GitHub and connect Pages.</div>
+      <div>Data source: Twelve Data daily time series via Cloudflare Pages Function (API key required).</div>
+      <div>Deploy: Cloudflare Pages + set <strong>TWELVE_DATA_API_KEY</strong> in project environment variables.</div>
     </footer>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script>
     (() => {
-      const STORAGE_KEY = 'familyLeague.v2';
-      const ROSTER_VERSION = '2026-roster-1';
-      // Fill START_PRICES and LOCK_TIMESTAMP together once prices are locked.
-      const LOCK_TIMESTAMP = '2026-01-01T22:52:53Z';
-      const START_PRICES = {
-        DC: null,
-        GOOG: null,
-        IBM: null,
-        SOFI: null,
-        NVDA: null,
-        AMZN: null,
-        LLY: null,
-        TTWO: null,
-        PLTR: null,
-        GOOGL: null,
-        AVGO: null,
-        MSFT: null,
-        AZO: null,
-        VZ: null,
-        HD: null
-      };
-      const DEFAULT_PARTICIPANTS = [
+      const API_ENDPOINT = './api/league';
+      const LEAGUE_START_DATE = '2026-01-01';
+      const MAX_HISTORY = 260;
+      const PARTICIPANTS = [
         { id: 'tucker', name: 'Tucker', tickers: ['DC', 'GOOG'] },
         { id: 'macy', name: 'Macy', tickers: ['IBM', 'SOFI'] },
         { id: 'will', name: 'Will', tickers: ['NVDA', 'AMZN'] },
@@ -556,7 +539,6 @@
         { id: 'hunter', name: 'Hunter', tickers: ['MSFT', 'AZO'] },
         { id: 'everett', name: 'Everett', tickers: ['VZ', 'HD'] }
       ];
-      const MAX_HISTORY = 180;
       const chartColors = [
         '#1d3b57',
         '#0a7a4b',
@@ -588,8 +570,7 @@
       let barChartInstance;
       let lineChartInstance;
       let isRefreshing = false;
-
-      const state = loadState();
+      let lastRanks = {};
 
       if (window.Chart) {
         Chart.defaults.font.family = '"IBM Plex Sans", "SF Pro Text", "Segoe UI", sans-serif';
@@ -597,59 +578,7 @@
       }
 
       dom.refreshBtn.addEventListener('click', () => refreshPrices());
-
-      render();
-      if (state.participants.length) {
-        refreshPrices({ silent: true });
-      }
-
-      function loadState() {
-        const fallback = buildInitialState();
-        try {
-          const raw = localStorage.getItem(STORAGE_KEY);
-          if (!raw) return fallback;
-          const parsed = JSON.parse(raw);
-          if (parsed.rosterVersion !== ROSTER_VERSION) return fallback;
-          return {
-            participants: Array.isArray(parsed.participants) ? parsed.participants : [],
-            history: Array.isArray(parsed.history) ? parsed.history : [],
-            lastUpdated: parsed.lastUpdated || null,
-            lastRanks: parsed.lastRanks || {},
-            lockTimestamp: parsed.lockTimestamp || null,
-            rosterVersion: parsed.rosterVersion || ROSTER_VERSION
-          };
-        } catch (error) {
-          return fallback;
-        }
-      }
-
-      function saveState() {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      }
-
-      function buildInitialState() {
-        const hasAllPrices = Object.values(START_PRICES).every((value) => typeof value === 'number');
-        const lockTimestamp = hasAllPrices ? Date.parse(LOCK_TIMESTAMP) : null;
-        const participants = DEFAULT_PARTICIPANTS.map((participant) => ({
-          ...participant,
-          startPrices: {
-            [participant.tickers[0]]: START_PRICES[participant.tickers[0]] ?? null,
-            [participant.tickers[1]]: START_PRICES[participant.tickers[1]] ?? null
-          },
-          startDate: lockTimestamp ? new Date(lockTimestamp).toISOString() : null
-        }));
-        const history = hasAllPrices && lockTimestamp
-          ? [{ timestamp: lockTimestamp, prices: { ...START_PRICES } }]
-          : [];
-        return {
-          participants,
-          history,
-          lastUpdated: lockTimestamp,
-          lastRanks: {},
-          lockTimestamp,
-          rosterVersion: ROSTER_VERSION
-        };
-      }
+      refreshPrices({ silent: true });
 
       function formatPercent(value) {
         if (typeof value !== 'number' || Number.isNaN(value)) return '--';
@@ -676,119 +605,8 @@
         }
       }
 
-      function getAllTickers() {
-        const tickers = new Set();
-        state.participants.forEach((participant) => {
-          participant.tickers.forEach((ticker) => tickers.add(ticker));
-        });
-        return Array.from(tickers);
-      }
-
-      function getLastKnownPrices() {
-        const result = {};
-        for (let i = state.history.length - 1; i >= 0; i -= 1) {
-          const snapshot = state.history[i].prices || {};
-          Object.keys(snapshot).forEach((ticker) => {
-            if (result[ticker] == null && snapshot[ticker] != null) {
-              result[ticker] = snapshot[ticker];
-            }
-          });
-        }
-        return result;
-      }
-
-      function appendSnapshot(prices) {
-        state.history.push({ timestamp: Date.now(), prices });
-        if (state.history.length > MAX_HISTORY) {
-          state.history.splice(0, state.history.length - MAX_HISTORY);
-        }
-        saveState();
-      }
-
-      function lockInStartPrices(prices) {
-        let didLock = false;
-        state.participants.forEach((participant) => {
-          if (!participant.startPrices) {
-            participant.startPrices = {};
-          }
-          participant.tickers.forEach((ticker) => {
-            if (participant.startPrices[ticker] == null && prices[ticker] != null) {
-              participant.startPrices[ticker] = prices[ticker];
-              didLock = true;
-            }
-          });
-        });
-        if (didLock && !state.lockTimestamp) {
-          state.lockTimestamp = Date.now();
-          const iso = new Date(state.lockTimestamp).toISOString();
-          state.participants.forEach((participant) => {
-            if (!participant.startDate) {
-              participant.startDate = iso;
-            }
-          });
-        }
-      }
-
-      async function fetchJson(url) {
-        const response = await fetch(url);
-        if (!response.ok) {
-          throw new Error('Price fetch failed');
-        }
-        return response.json();
-      }
-
-      async function fetchJsonWithFallback(directUrl) {
-        try {
-          return await fetchJson(directUrl);
-        } catch (error) {
-          const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`;
-          return fetchJson(proxyUrl);
-        }
-      }
-
-      function pickPrice(quote) {
-        const keys = [
-          'regularMarketPrice',
-          'postMarketPrice',
-          'preMarketPrice',
-          'regularMarketPreviousClose',
-          'regularMarketOpen'
-        ];
-        for (const key of keys) {
-          const value = quote?.[key];
-          if (typeof value === 'number' && !Number.isNaN(value)) {
-            return value;
-          }
-        }
-        return null;
-      }
-
-      async function fetchPrices(tickers) {
-        if (!tickers.length) return { prices: {}, failed: [] };
-        const symbols = tickers.join(',');
-        // Data fetch: Yahoo Finance quote endpoint (no API key required).
-        // If blocked by CORS (common for file://), fall back to a public CORS proxy.
-        const directUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}`;
-        const payload = await fetchJsonWithFallback(directUrl);
-        const results = payload?.quoteResponse?.result || [];
-        const prices = {};
-        results.forEach((item) => {
-          const price = pickPrice(item);
-          if (item?.symbol && price != null) {
-            prices[item.symbol.toUpperCase()] = price;
-          }
-        });
-        const failed = tickers.filter((ticker) => prices[ticker] == null);
-        return { prices, failed };
-      }
-
       async function refreshPrices({ silent } = {}) {
         if (isRefreshing) return;
-        const tickers = getAllTickers();
-        if (!tickers.length) {
-          setStatus('Add participants to begin.', 'muted');
-          return;
-        }
 
         isRefreshing = true;
         dom.refreshBtn.disabled = true;
@@ -797,62 +615,108 @@
         }
 
         try {
-          const { prices, failed } = await fetchPrices(tickers);
-          if (Object.keys(prices).length) {
-            lockInStartPrices(prices);
-            appendSnapshot(prices);
-            state.lastUpdated = Date.now();
-            saveState();
-          }
+          const payload = await fetchLeagueData();
+          render(payload);
+          const failed = Object.keys(payload?.errors || {});
           if (failed.length) {
-            setStatus(`Some prices unavailable: ${failed.join(', ')}`, 'warn');
+            setStatus(`Some symbols unavailable: ${failed.join(', ')}`, 'warn');
           } else if (!silent) {
             setStatus('Prices updated.', 'ok');
           }
         } catch (error) {
-          setStatus('Price refresh failed. Check symbols or network.', 'warn');
+          setStatus('Price refresh failed. Check the API key.', 'warn');
         } finally {
           isRefreshing = false;
           dom.refreshBtn.disabled = false;
-          render();
         }
       }
 
-      function computeStats(currentPrices) {
-        return state.participants.map((participant) => {
-          const returns = participant.tickers.map((ticker) => {
-            const start = participant.startPrices[ticker];
-            const current = currentPrices[ticker];
-            if (start == null || current == null) return null;
-            // Returns: (current - start) / start * 100.
-            return ((current - start) / start) * 100;
+      async function fetchLeagueData() {
+        const response = await fetch(API_ENDPOINT, { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error('League data unavailable');
+        }
+        return response.json();
+      }
+
+      function normalizeSeries(values) {
+        if (!Array.isArray(values)) return [];
+        return values
+          .map((item) => {
+            const rawDate = item?.date || item?.datetime;
+            const close = Number(item?.close);
+            if (!rawDate || !Number.isFinite(close)) return null;
+            return { date: rawDate.slice(0, 10), close };
+          })
+          .filter(Boolean)
+          .sort((a, b) => a.date.localeCompare(b.date));
+      }
+
+      function prepareSeries(rawSeries) {
+        const seriesByTicker = {};
+        const mapsByTicker = {};
+        const dateSet = new Set();
+
+        Object.entries(rawSeries || {}).forEach(([symbol, values]) => {
+          const normalized = normalizeSeries(values);
+          seriesByTicker[symbol] = normalized;
+          const map = new Map();
+          normalized.forEach((point) => {
+            map.set(point.date, point.close);
+            dateSet.add(point.date);
           });
-          const hasAll = returns.every((value) => typeof value === 'number');
-          const avgReturn = hasAll
-            ? (returns[0] + returns[1]) / returns.length
+          mapsByTicker[symbol] = map;
+        });
+
+        return {
+          seriesByTicker,
+          mapsByTicker,
+          labels: Array.from(dateSet).sort()
+        };
+      }
+
+      function computeReturn(start, current) {
+        if (!Number.isFinite(start) || !Number.isFinite(current) || start === 0) return null;
+        return ((current - start) / start) * 100;
+      }
+
+      function computeStats(seriesByTicker) {
+        return PARTICIPANTS.map((participant) => {
+          const [tickerOne, tickerTwo] = participant.tickers;
+          const seriesOne = seriesByTicker[tickerOne] || [];
+          const seriesTwo = seriesByTicker[tickerTwo] || [];
+          const startOne = seriesOne[0]?.close ?? null;
+          const startTwo = seriesTwo[0]?.close ?? null;
+          const currentOne = seriesOne[seriesOne.length - 1]?.close ?? null;
+          const currentTwo = seriesTwo[seriesTwo.length - 1]?.close ?? null;
+          const returnOne = computeReturn(startOne, currentOne);
+          const returnTwo = computeReturn(startTwo, currentTwo);
+          const avgReturn = returnOne != null && returnTwo != null
+            ? (returnOne + returnTwo) / 2
             : null;
 
           let bestStock = null;
-          if (hasAll) {
-            const bestIndex = returns[0] >= returns[1] ? 0 : 1;
-            bestStock = {
-              ticker: participant.tickers[bestIndex],
-              value: returns[bestIndex]
-            };
+          if (returnOne != null && returnTwo != null) {
+            bestStock = returnOne >= returnTwo
+              ? { ticker: tickerOne, value: returnOne }
+              : { ticker: tickerTwo, value: returnTwo };
           }
 
           return {
             ...participant,
-            returns,
             avgReturn,
-            bestStock
+            bestStock,
+            startPrices: {
+              [tickerOne]: startOne,
+              [tickerTwo]: startTwo
+            }
           };
         });
       }
 
-      function render() {
-        const currentPrices = getLastKnownPrices();
-        const stats = computeStats(currentPrices);
+      function render(payload) {
+        const prepared = prepareSeries(payload?.series || {});
+        const stats = computeStats(prepared.seriesByTicker);
         const ranked = stats
           .slice()
           .sort((a, b) => (b.avgReturn ?? -Infinity) - (a.avgReturn ?? -Infinity))
@@ -861,19 +725,20 @@
             rank: index + 1
           }));
 
-        renderLeaderCard(ranked[0]);
+        const lockDate = payload?.startDate || LEAGUE_START_DATE;
+        renderLeaderCard(ranked[0], lockDate);
         renderLeaderboard(ranked);
-        renderCharts(ranked);
+        renderCharts(ranked, prepared);
 
-        dom.lastUpdated.textContent = state.lastUpdated
-          ? formatTime(new Date(state.lastUpdated))
+        dom.lastUpdated.textContent = payload?.fetchedAt
+          ? formatTime(new Date(payload.fetchedAt))
           : '--:--';
-        dom.lockDate.textContent = state.lockTimestamp
-          ? formatDate(new Date(state.lockTimestamp))
+        dom.lockDate.textContent = lockDate
+          ? formatDate(new Date(lockDate))
           : '--';
       }
 
-      function renderLeaderCard(leader) {
+      function renderLeaderCard(leader, lockDate) {
         if (!leader) {
           dom.leaderCard.classList.add('empty');
           dom.leaderName.textContent = 'No participants yet';
@@ -894,8 +759,8 @@
         dom.leaderBest.textContent = leader.bestStock
           ? `${leader.bestStock.ticker} ${formatPercent(leader.bestStock.value)}`
           : '--';
-        dom.leaderStart.textContent = leader.startDate
-          ? formatDate(new Date(leader.startDate))
+        dom.leaderStart.textContent = lockDate
+          ? formatDate(new Date(lockDate))
           : '--';
 
         dom.leaderReturn.classList.toggle('positive', leader.avgReturn > 0);
@@ -909,13 +774,12 @@
           const cell = document.createElement('td');
           cell.colSpan = 4;
           cell.className = 'empty-state';
-          cell.textContent = 'Add participants to see rankings.';
+          cell.textContent = 'Waiting for price data.';
           row.appendChild(cell);
           dom.leaderboardBody.appendChild(row);
           return;
         }
 
-        const lastRanks = state.lastRanks || {};
         const nextRanks = {};
 
         ranked.forEach((participant) => {
@@ -979,16 +843,17 @@
           dom.leaderboardBody.appendChild(row);
         });
 
-        state.lastRanks = nextRanks;
-        saveState();
+        lastRanks = nextRanks;
       }
 
-      function renderCharts(ranked) {
+      function renderCharts(ranked, prepared) {
         if (!window.Chart) return;
+        if (!prepared.labels.length) return;
 
-        const labels = state.history.map((snapshot) => {
-          const date = new Date(snapshot.timestamp);
-          return `${date.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${formatTime(date)}`;
+        const trimmedLabels = prepared.labels.slice(-MAX_HISTORY);
+        const labels = trimmedLabels.map((value) => {
+          const date = new Date(`${value}T00:00:00`);
+          return `${date.toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
         });
 
         const barLabels = ranked.map((participant) => participant.name);
@@ -1022,16 +887,18 @@
 
         const lineDatasets = ranked.map((participant, index) => {
           const color = chartColors[index % chartColors.length];
-          const data = state.history.map((snapshot) => {
-            const prices = snapshot.prices || {};
-            const returns = participant.tickers.map((ticker) => {
-              const start = participant.startPrices[ticker];
-              const current = prices[ticker];
-              if (start == null || current == null) return null;
-              return ((current - start) / start) * 100;
-            });
-            if (returns.some((value) => value == null)) return null;
-            return (returns[0] + returns[1]) / returns.length;
+          const [tickerOne, tickerTwo] = participant.tickers;
+          const mapOne = prepared.mapsByTicker[tickerOne] || new Map();
+          const mapTwo = prepared.mapsByTicker[tickerTwo] || new Map();
+          const startOne = prepared.seriesByTicker[tickerOne]?.[0]?.close ?? null;
+          const startTwo = prepared.seriesByTicker[tickerTwo]?.[0]?.close ?? null;
+          const data = trimmedLabels.map((date) => {
+            const priceOne = mapOne.get(date);
+            const priceTwo = mapTwo.get(date);
+            const returnOne = computeReturn(startOne, priceOne);
+            const returnTwo = computeReturn(startTwo, priceTwo);
+            if (returnOne == null || returnTwo == null) return null;
+            return (returnOne + returnTwo) / 2;
           });
 
           return {
@@ -1118,5 +985,6 @@
       }
     })();
   </script>
+
 </body>
 </html>

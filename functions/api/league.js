@@ -17,6 +17,7 @@ const SYMBOLS = [
 ];
 const START_DATE = '2026-01-01';
 const INTERVAL = '1day';
+const OUTPUT_SIZE = '400';
 const DEFAULT_TTL_SECONDS = 24 * 60 * 60;
 
 function jsonResponse(payload, { status = 200, ttl = DEFAULT_TTL_SECONDS } = {}) {
@@ -55,6 +56,7 @@ async function fetchSeries(symbol, apiKey) {
   url.searchParams.set('symbol', symbol);
   url.searchParams.set('interval', INTERVAL);
   url.searchParams.set('start_date', START_DATE);
+  url.searchParams.set('outputsize', OUTPUT_SIZE);
   url.searchParams.set('apikey', apiKey);
   url.searchParams.set('format', 'JSON');
 
