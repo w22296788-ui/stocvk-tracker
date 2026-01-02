@@ -112,6 +112,44 @@
       display: none;
     }
 
+    .error-panel {
+      margin-bottom: var(--space-4);
+      padding: var(--space-3) var(--space-4);
+      border-radius: var(--radius-sm);
+      border: 1px solid rgba(179, 59, 46, 0.2);
+      background: rgba(179, 59, 46, 0.08);
+      color: var(--ink);
+      display: none;
+    }
+
+    .error-panel.active {
+      display: block;
+    }
+
+    .error-panel h3 {
+      margin: 0 0 var(--space-1);
+      font-size: 14px;
+      letter-spacing: 0.02em;
+    }
+
+    .error-panel ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--ink);
+    }
+
+    .error-panel li {
+      margin: 4px 0;
+      font-size: 13px;
+      color: var(--ink);
+    }
+
+    .error-panel .error-meta {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: var(--space-1);
+    }
+
     .actions {
       display: flex;
       align-items: center;
@@ -452,6 +490,8 @@
       </div>
     </header>
 
+    <section class="error-panel" id="errorPanel" aria-live="polite"></section>
+
     <section class="leader-card empty" id="leaderCard">
       <div>
         <div class="leader-label">
@@ -529,6 +569,8 @@
       const API_ENDPOINT = './api/league';
       const LEAGUE_START_DATE = '2026-01-01';
       const MAX_HISTORY = 260;
+      const LOCAL_CACHE_KEY = 'leagueCache.v1';
+      const FALLBACK_TTL_MS = 24 * 60 * 60 * 1000;
       const PARTICIPANTS = [
         { id: 'tucker', name: 'Tucker', tickers: ['DC', 'GOOG'] },
         { id: 'macy', name: 'Macy', tickers: ['IBM', 'SOFI'] },
@@ -554,6 +596,7 @@
         lastUpdated: document.getElementById('lastUpdated'),
         lockDate: document.getElementById('lockDate'),
         statusLine: document.getElementById('statusLine'),
+        errorPanel: document.getElementById('errorPanel'),
         refreshBtn: document.getElementById('refreshBtn'),
         leaderCard: document.getElementById('leaderCard'),
         leaderCrown: document.getElementById('leaderCrown'),
@@ -571,14 +614,37 @@
       let lineChartInstance;
       let isRefreshing = false;
       let lastRanks = {};
+      let scheduledRefreshTimer = null;
 
       if (window.Chart) {
         Chart.defaults.font.family = '"IBM Plex Sans", "SF Pro Text", "Segoe UI", sans-serif';
         Chart.defaults.color = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim();
       }
 
-      dom.refreshBtn.addEventListener('click', () => refreshPrices());
-      refreshPrices({ silent: true });
+      dom.refreshBtn.addEventListener('click', () => refreshPrices({ skipIfFresh: true }));
+      const bootCache = readLocalCache();
+      if (isCacheFresh(bootCache)) {
+        render(bootCache.payload);
+        const cachedSummary = summarizeErrors(bootCache.payload?.errors, bootCache.payload?.symbols?.length);
+        const cachedNotice = bootCache.payload?.notice;
+        if (cachedSummary.failedSymbols.length) {
+          setStatus(`Using cached data. ${cachedSummary.summary || 'Some symbols unavailable.'}`, 'warn');
+          renderErrorPanel(cachedSummary);
+        } else if (cachedNotice) {
+          setStatus(cachedNotice, 'muted');
+          renderErrorPanel(null);
+        } else {
+          const nextRefresh = new Date(bootCache.fetchedAtMs + bootCache.ttlMs);
+          setStatus(`Using cached data. Next refresh ${formatDateTime(nextRefresh)}.`, 'muted');
+          renderErrorPanel(null);
+        }
+      }
+      updateRefreshState();
+      if (bootCache?.payload?.partial) {
+        scheduleNextRefresh(bootCache.payload);
+      }
+      window.setInterval(updateRefreshState, 60 * 1000);
+      refreshPrices({ silent: true, skipIfFresh: true });
 
       function formatPercent(value) {
         if (typeof value !== 'number' || Number.isNaN(value)) return '--';
@@ -594,6 +660,49 @@
         return value.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
       }
 
+      function formatDateTime(value) {
+        return `${formatDate(value)} ${formatTime(value)}`;
+      }
+
+      function getCacheTtlMs(payload) {
+        const ttlSeconds = Number(payload?.cacheTtlSeconds);
+        if (Number.isFinite(ttlSeconds) && ttlSeconds > 0) {
+          return ttlSeconds * 1000;
+        }
+        return FALLBACK_TTL_MS;
+      }
+
+      function readLocalCache() {
+        try {
+          const raw = localStorage.getItem(LOCAL_CACHE_KEY);
+          if (!raw) return null;
+          const payload = JSON.parse(raw);
+          const fetchedAtMs = Date.parse(payload?.fetchedAt);
+          if (!Number.isFinite(fetchedAtMs)) return null;
+          const ttlMs = getCacheTtlMs(payload);
+          return {
+            payload,
+            fetchedAtMs,
+            ttlMs
+          };
+        } catch (error) {
+          return null;
+        }
+      }
+
+      function isCacheFresh(cache) {
+        if (!cache) return false;
+        return Date.now() - cache.fetchedAtMs < cache.ttlMs;
+      }
+
+      function writeLocalCache(payload) {
+        try {
+          localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(payload));
+        } catch (error) {
+          // Ignore storage errors (private mode, quota, etc.)
+        }
+      }
+
       function setStatus(message, level) {
         dom.statusLine.textContent = message || '';
         dom.statusLine.dataset.level = level || 'muted';
@@ -605,38 +714,217 @@
         }
       }
 
-      async function refreshPrices({ silent } = {}) {
+      function updateRefreshState({ forceDisabled } = {}) {
+        if (!dom.refreshBtn) return;
+        if (forceDisabled) {
+          dom.refreshBtn.disabled = true;
+          return;
+        }
+        const cache = readLocalCache();
+        if (isCacheFresh(cache)) {
+          if (cache?.payload?.partial && cache.payload?.nextFetchAfter) {
+            const nextBatch = new Date(cache.payload.nextFetchAfter);
+            dom.refreshBtn.disabled = true;
+            dom.refreshBtn.title = `Next batch ${formatDateTime(nextBatch)}.`;
+            return;
+          }
+          const nextRefresh = new Date(cache.fetchedAtMs + cache.ttlMs);
+          dom.refreshBtn.disabled = true;
+          dom.refreshBtn.title = `Refresh available ${formatDateTime(nextRefresh)}.`;
+        } else {
+          dom.refreshBtn.disabled = false;
+          dom.refreshBtn.title = 'Refresh prices';
+        }
+      }
+
+      function scheduleNextRefresh(payload) {
+        if (scheduledRefreshTimer) {
+          window.clearTimeout(scheduledRefreshTimer);
+          scheduledRefreshTimer = null;
+        }
+        if (!payload?.partial) return;
+        const nextFetchMs = Date.parse(payload?.nextFetchAfter);
+        if (!Number.isFinite(nextFetchMs)) return;
+        const delayMs = Math.max(0, nextFetchMs - Date.now());
+        scheduledRefreshTimer = window.setTimeout(() => {
+          refreshPrices({ silent: true, skipIfFresh: true });
+        }, delayMs);
+      }
+
+      function normalizeErrorEntry(value) {
+        if (!value) return null;
+        if (typeof value === 'string') return { message: value };
+        if (typeof value === 'object') {
+          return {
+            message: value.message || value.error || 'Unknown error',
+            code: value.code,
+            status: value.status
+          };
+        }
+        return { message: String(value) };
+      }
+
+      function summarizeErrors(errors, totalSymbols) {
+        const entries = Object.entries(errors || {})
+          .map(([symbol, value]) => {
+            const normalized = normalizeErrorEntry(value);
+            return normalized ? { symbol, ...normalized } : null;
+          })
+          .filter(Boolean);
+        const failedSymbols = entries.map((entry) => entry.symbol);
+        const uniqueMessages = Array.from(new Set(entries.map((entry) => entry.message)));
+        const allFailed = totalSymbols ? failedSymbols.length === totalSymbols : false;
+        let summary = '';
+        if (allFailed && uniqueMessages.length === 1) {
+          summary = `All symbols failed: ${uniqueMessages[0]}`;
+        } else if (allFailed && uniqueMessages.length > 1) {
+          summary = 'All symbols failed (multiple errors). Check console for details.';
+        } else if (uniqueMessages.length === 1 && failedSymbols.length) {
+          summary = `Some symbols unavailable (${uniqueMessages[0]}): ${failedSymbols.join(', ')}`;
+        } else if (failedSymbols.length) {
+          summary = `Some symbols unavailable (multiple errors): ${failedSymbols.join(', ')}`;
+        }
+        return { entries, failedSymbols, uniqueMessages, allFailed, summary };
+      }
+
+      function renderErrorPanel(summary) {
+        if (!dom.errorPanel) return;
+        dom.errorPanel.innerHTML = '';
+        dom.errorPanel.classList.remove('active');
+        if (!summary || !summary.entries.length) return;
+
+        dom.errorPanel.classList.add('active');
+        const title = document.createElement('h3');
+        title.textContent = 'Data fetch errors';
+        dom.errorPanel.appendChild(title);
+
+        const meta = document.createElement('div');
+        meta.className = 'error-meta';
+        if (summary.uniqueMessages.length === 1) {
+          meta.textContent = `Reason: ${summary.uniqueMessages[0]}`;
+        } else {
+          meta.textContent = 'Multiple error reasons returned by provider.';
+        }
+        dom.errorPanel.appendChild(meta);
+
+        const list = document.createElement('ul');
+        summary.entries.forEach((entry) => {
+          const item = document.createElement('li');
+          const parts = [`${entry.symbol}: ${entry.message}`];
+          const detailParts = [];
+          if (entry.code) detailParts.push(`code ${entry.code}`);
+          if (entry.status) detailParts.push(`status ${entry.status}`);
+          if (detailParts.length) {
+            parts.push(`(${detailParts.join(', ')})`);
+          }
+          item.textContent = parts.join(' ');
+          list.appendChild(item);
+        });
+        dom.errorPanel.appendChild(list);
+      }
+
+      async function refreshPrices({ silent, skipIfFresh, force } = {}) {
         if (isRefreshing) return;
 
+        const localCache = readLocalCache();
+        if (!force && skipIfFresh && isCacheFresh(localCache)) {
+          const summary = summarizeErrors(localCache.payload?.errors, localCache.payload?.symbols?.length);
+          const nextBatch = localCache?.payload?.partial && localCache.payload?.nextFetchAfter
+            ? new Date(localCache.payload.nextFetchAfter)
+            : null;
+          const notice = localCache?.payload?.notice;
+          if (!silent) {
+            if (summary.failedSymbols.length) {
+              const suffix = nextBatch ? ` Next batch ${formatDateTime(nextBatch)}.` : '';
+              setStatus(`Using cached data. ${summary.summary || 'Some symbols unavailable.'}${suffix}`, 'warn');
+            } else if (notice) {
+              setStatus(notice, 'muted');
+            } else {
+              if (nextBatch) {
+                setStatus(`Using cached data. Next batch ${formatDateTime(nextBatch)}.`, 'muted');
+              } else {
+                const nextRefresh = new Date(localCache.fetchedAtMs + localCache.ttlMs);
+                setStatus(`Using cached data. Next refresh ${formatDateTime(nextRefresh)}.`, 'muted');
+              }
+            }
+          }
+          if (summary.failedSymbols.length) {
+            renderErrorPanel(summary);
+          } else {
+            renderErrorPanel(null);
+          }
+          scheduleNextRefresh(localCache.payload);
+          return;
+        }
+
         isRefreshing = true;
-        dom.refreshBtn.disabled = true;
+        updateRefreshState({ forceDisabled: true });
         if (!silent) {
           setStatus('Refreshing prices...', 'muted');
         }
 
         try {
           const payload = await fetchLeagueData();
-          render(payload);
-          const failed = Object.keys(payload?.errors || {});
-          if (failed.length) {
-            setStatus(`Some symbols unavailable: ${failed.join(', ')}`, 'warn');
-          } else if (!silent) {
-            setStatus('Prices updated.', 'ok');
+          if (payload?.error) {
+            throw new Error(payload.error);
           }
+          render(payload);
+          const hasSeries = Object.keys(payload?.series || {}).length > 0;
+          const shouldCache = hasSeries || payload?.notice || payload?.partial;
+          if (shouldCache) {
+            writeLocalCache(payload);
+          }
+          const summary = summarizeErrors(payload?.errors, payload?.symbols?.length);
+          const nextBatch = payload?.partial && payload?.nextFetchAfter
+            ? new Date(payload.nextFetchAfter)
+            : null;
+          const notice = payload?.notice;
+          if (summary.failedSymbols.length) {
+            const suffix = nextBatch ? ` Next batch ${formatDateTime(nextBatch)}.` : '';
+            setStatus(`${summary.summary || 'Some symbols unavailable.'}${suffix}`, 'warn');
+            renderErrorPanel(summary);
+            console.warn('Price fetch errors', summary.entries);
+          } else if (notice) {
+            setStatus(notice, 'muted');
+            renderErrorPanel(null);
+          } else {
+            if (!silent) {
+              if (nextBatch) {
+                setStatus(`Batch updated. Next batch ${formatDateTime(nextBatch)}.`, 'muted');
+              } else {
+                setStatus('Prices updated.', 'ok');
+              }
+            }
+            renderErrorPanel(null);
+          }
+          scheduleNextRefresh(payload);
         } catch (error) {
-          setStatus('Price refresh failed. Check the API key.', 'warn');
+          const message = error?.message || 'Price refresh failed. Check the API key.';
+          const fallback = readLocalCache();
+          if (fallback?.payload) {
+            render(fallback.payload);
+            setStatus(`Using cached data (refresh failed: ${message}).`, 'warn');
+            renderErrorPanel(null);
+            scheduleNextRefresh(fallback.payload);
+            return;
+          }
+          setStatus(message, 'warn');
+          renderErrorPanel(null);
         } finally {
           isRefreshing = false;
-          dom.refreshBtn.disabled = false;
+          updateRefreshState();
         }
       }
 
       async function fetchLeagueData() {
         const response = await fetch(API_ENDPOINT, { cache: 'no-store' });
+        const payload = await response.json().catch(() => null);
         if (!response.ok) {
-          throw new Error('League data unavailable');
+          const message = payload?.error || 'League data unavailable';
+          const details = payload?.details ? ` ${payload.details}` : '';
+          throw new Error(`${message}${details}`);
         }
-        return response.json();
+        return payload;
       }
 
       function normalizeSeries(values) {
